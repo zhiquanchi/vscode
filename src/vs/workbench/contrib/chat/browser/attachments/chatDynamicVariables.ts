@@ -16,6 +16,7 @@ import { ICommandService } from '../../../../../platform/commands/common/command
 import { ServicesAccessor } from '../../../../../platform/instantiation/common/instantiation.js';
 import { ILabelService } from '../../../../../platform/label/common/label.js';
 import { IChatRequestVariableValue, IDynamicVariable } from '../../common/attachments/chatVariables.js';
+import { IChatRequestVariableEntry } from '../../common/attachments/chatVariableEntries.js';
 import { IChatWidget } from '../chat.js';
 import { IChatWidgetContrib } from '../widget/chatWidget.js';
 
@@ -160,6 +161,60 @@ export class ChatDynamicVariableModel extends Disposable implements IChatWidgetC
 		this._onDidChangeReferences.fire();
 	}
 
+	/**
+	 * Inserts file, folder, and file-selection entries into the prompt as inline references.
+	 */
+	insertFileReferences(entries: readonly IChatRequestVariableEntry[]): boolean {
+		const editor = this.widget.inputEditor;
+		const model = editor.getModel();
+		const position = editor.getPosition();
+		if (!model || !position || entries.length === 0) {
+			return false;
+		}
+
+		const references = entries.map(entry => ({ entry, text: this.getFileReferenceText(entry) }));
+		const offset = model.getOffsetAt(position);
+		const value = model.getValue();
+		const prefix = offset > 0 && !/\s/.test(value.charAt(offset - 1)) ? ' ' : '';
+		const suffix = offset === value.length || (offset < value.length && !/\s/.test(value.charAt(offset))) ? ' ' : '';
+		const insertedText = prefix + references.map(reference => reference.text).join(' ') + suffix;
+		const insertionRange = Range.fromPositions(position);
+		if (!editor.executeEdits(this.id, [{ range: insertionRange, text: insertedText }])) {
+			return false;
+		}
+
+		let startColumn = position.column + prefix.length;
+		for (const { entry, text } of references) {
+			this.addReference({
+				id: entry.id,
+				fullName: entry.fullName ?? entry.name,
+				modelDescription: entry.modelDescription,
+				range: new Range(position.lineNumber, startColumn, position.lineNumber, startColumn + text.length),
+				icon: entry.icon,
+				isFile: entry.kind === 'file',
+				isDirectory: entry.kind === 'directory',
+				data: entry.value,
+				references: entry.references,
+				omittedState: entry.omittedState,
+				imageCount: entry.kind === 'directory' ? entry.imageCount : undefined,
+				_meta: entry._meta,
+			});
+			startColumn += text.length + 1;
+		}
+
+		editor.setPosition({ lineNumber: position.lineNumber, column: position.column + insertedText.length });
+		return true;
+	}
+
+	private getFileReferenceText(entry: IChatRequestVariableEntry): string {
+		if (entry.kind === 'file' && isLocation(entry.value)) {
+			const { startLineNumber, endLineNumber } = entry.value.range;
+			const lineRange = startLineNumber === endLineNumber ? `${startLineNumber}` : `${startLineNumber}-${endLineNumber}`;
+			return `@${entry.name}:${lineRange}`;
+		}
+		return `@${entry.name}`;
+	}
+
 	private updateDecorations(): void {
 		const model = this.widget.inputEditor.getModel();
 		if (!model) {
@@ -188,9 +243,8 @@ export class ChatDynamicVariableModel extends Disposable implements IChatWidgetC
 		if (URI.isUri(value)) {
 			return new MarkdownString(this.labelService.getUriLabel(value, { relative: true }));
 		} else if (isLocation(value)) {
-			const prefix = ref.fullName ? ` ${ref.fullName}` : '';
-			const rangeString = `#${value.range.startLineNumber}-${value.range.endLineNumber}`;
-			return new MarkdownString(prefix + this.labelService.getUriLabel(value.uri, { relative: true }) + rangeString);
+			const rangeString = `#${value.range.startLineNumber}:${value.range.startColumn}-${value.range.endLineNumber}:${value.range.endColumn}`;
+			return new MarkdownString(this.labelService.getUriLabel(value.uri, { relative: true }) + rangeString);
 		} else {
 			return undefined;
 		}

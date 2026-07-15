@@ -12,9 +12,11 @@ import { MouseTargetType } from '../../../../../../../editor/browser/editorBrows
 import { ICodeEditorService } from '../../../../../../../editor/browser/services/codeEditorService.js';
 import { Position } from '../../../../../../../editor/common/core/position.js';
 import { Range } from '../../../../../../../editor/common/core/range.js';
+import { isLocation } from '../../../../../../../editor/common/languages.js';
 import { IDecorationOptions } from '../../../../../../../editor/common/editorCommon.js';
 import { TrackedRangeStickiness } from '../../../../../../../editor/common/model.js';
 import { ILabelService } from '../../../../../../../platform/label/common/label.js';
+import { ICommandService } from '../../../../../../../platform/commands/common/commands.js';
 import { IThemeService } from '../../../../../../../platform/theme/common/themeService.js';
 import { getInputPlaceholderColor, getRangeForPlaceholder } from './chatInputPlaceholderDecoration.js';
 import { IChatAgentCommand, IChatAgentData, IChatAgentService } from '../../../../common/participants/chatAgents.js';
@@ -24,7 +26,7 @@ import { ChatRequestAgentPart, ChatRequestAgentSubcommandPart, ChatRequestDynami
 import { agentReg, slashReg, variableReg } from '../../../../common/requestParser/chatRequestParser.js';
 import { IChatWidget } from '../../../chat.js';
 import { ChatWidget } from '../../chatWidget.js';
-import { dynamicVariableDecorationType } from '../../../attachments/chatDynamicVariables.js';
+import { ChatDynamicVariableModel, dynamicVariableDecorationType } from '../../../attachments/chatDynamicVariables.js';
 import { NativeEditContextRegistry } from '../../../../../../../editor/browser/controller/editContext/native/nativeEditContextRegistry.js';
 import { TextAreaEditContextRegistry } from '../../../../../../../editor/browser/controller/editContext/textArea/textAreaEditContextRegistry.js';
 import { CancellationToken } from '../../../../../../../base/common/cancellation.js';
@@ -33,6 +35,7 @@ import { isCancellationError } from '../../../../../../../base/common/errors.js'
 import { IEditorService } from '../../../../../../services/editor/common/editorService.js';
 import { getChatSessionType } from '../../../../common/model/chatUri.js';
 import { ICustomizationHarnessService } from '../../../../common/customizationHarnessService.js';
+import { revealInSideBarCommand } from '../../../../../files/browser/fileActions.contribution.js';
 
 const decorationDescription = 'chat';
 const placeholderDecorationType = 'chat-session-detail';
@@ -67,6 +70,7 @@ class InputEditorDecorations extends Disposable {
 	private readonly previouslyUsedAgents = new Set<string>();
 	private clickablePromptSlashCommand: { range: Range; uri: URI } | undefined;
 	private mouseDownPromptSlashCommand: { position: Position; uri: URI; range: Range } | undefined;
+	private mouseDownDynamicVariable: { position: Position; id: string; range: Range } | undefined;
 
 	private readonly viewModelDisposables = this._register(new MutableDisposable());
 
@@ -81,6 +85,7 @@ class InputEditorDecorations extends Disposable {
 		@ILabelService private readonly labelService: ILabelService,
 		@ICustomizationHarnessService private readonly customizationHarnessService: ICustomizationHarnessService,
 		@IEditorService private readonly editorService: IEditorService,
+		@ICommandService private readonly commandService: ICommandService,
 	) {
 		super();
 
@@ -98,8 +103,18 @@ class InputEditorDecorations extends Disposable {
 		}));
 		this._register(this.widget.inputEditor.onMouseDown(e => {
 			this.mouseDownPromptSlashCommand = undefined;
+			this.mouseDownDynamicVariable = undefined;
 
 			if (!e.event.leftButton || e.target.type !== MouseTargetType.CONTENT_TEXT || !e.target.position) {
+				return;
+			}
+
+			const position = Position.lift(e.target.position);
+			const dynamicVariable = this.widget.getContrib<ChatDynamicVariableModel>(ChatDynamicVariableModel.ID)?.variables.find(variable =>
+				(variable.isFile || variable.isDirectory) && Range.containsPosition(variable.range, position)
+			);
+			if (dynamicVariable) {
+				this.mouseDownDynamicVariable = { position, id: dynamicVariable.id, range: Range.lift(dynamicVariable.range) };
 				return;
 			}
 
@@ -116,7 +131,25 @@ class InputEditorDecorations extends Disposable {
 		}));
 		this._register(this.widget.inputEditor.onMouseUp(e => {
 			const mouseDownPromptSlashCommand = this.mouseDownPromptSlashCommand;
+			const mouseDownDynamicVariable = this.mouseDownDynamicVariable;
 			this.mouseDownPromptSlashCommand = undefined;
+			this.mouseDownDynamicVariable = undefined;
+
+			if (mouseDownDynamicVariable && e.target.type === MouseTargetType.CONTENT_TEXT && e.target.position && mouseDownDynamicVariable.range.containsPosition(e.target.position) && Position.equals(mouseDownDynamicVariable.position, e.target.position)) {
+				const variable = this.widget.getContrib<ChatDynamicVariableModel>(ChatDynamicVariableModel.ID)?.variables.find(candidate => candidate.id === mouseDownDynamicVariable.id && Range.equalsRange(candidate.range, mouseDownDynamicVariable.range));
+				if (variable) {
+					const resource = URI.isUri(variable.data) ? variable.data : isLocation(variable.data) ? variable.data.uri : undefined;
+					const selection = isLocation(variable.data) ? variable.data.range : undefined;
+					if (resource) {
+						if (variable.isDirectory) {
+							void this.commandService.executeCommand(revealInSideBarCommand.id, resource);
+						} else {
+							void this.editorService.openEditor({ resource, options: { selection } });
+						}
+					}
+				}
+				return;
+			}
 
 			if (!mouseDownPromptSlashCommand || e.target.type !== MouseTargetType.CONTENT_TEXT || !e.target.position) {
 				return;
@@ -179,6 +212,7 @@ class InputEditorDecorations extends Disposable {
 			color: themeColorFromId(chatSlashCommandForeground),
 			backgroundColor: themeColorFromId(chatSlashCommandBackground),
 			borderRadius: '3px',
+			cursor: 'pointer',
 			rangeBehavior: TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges
 		}));
 	}
