@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { MarkdownString } from '../../../../../../../base/common/htmlContent.js';
+import { KeyCode, KeyMod } from '../../../../../../../base/common/keyCodes.js';
 import { Disposable, MutableDisposable } from '../../../../../../../base/common/lifecycle.js';
 import { autorun } from '../../../../../../../base/common/observable.js';
 import { themeColorFromId } from '../../../../../../../base/common/themables.js';
@@ -12,21 +13,27 @@ import { MouseTargetType } from '../../../../../../../editor/browser/editorBrows
 import { ICodeEditorService } from '../../../../../../../editor/browser/services/codeEditorService.js';
 import { Position } from '../../../../../../../editor/common/core/position.js';
 import { Range } from '../../../../../../../editor/common/core/range.js';
-import { isLocation } from '../../../../../../../editor/common/languages.js';
 import { IDecorationOptions } from '../../../../../../../editor/common/editorCommon.js';
+import { isLocation } from '../../../../../../../editor/common/languages.js';
 import { TrackedRangeStickiness } from '../../../../../../../editor/common/model.js';
 import { ILabelService } from '../../../../../../../platform/label/common/label.js';
+import { Action2, registerAction2 } from '../../../../../../../platform/actions/common/actions.js';
 import { ICommandService } from '../../../../../../../platform/commands/common/commands.js';
+import { ServicesAccessor } from '../../../../../../../platform/instantiation/common/instantiation.js';
+import { KeybindingWeight } from '../../../../../../../platform/keybinding/common/keybindingsRegistry.js';
 import { IThemeService } from '../../../../../../../platform/theme/common/themeService.js';
 import { getInputPlaceholderColor, getRangeForPlaceholder } from './chatInputPlaceholderDecoration.js';
 import { IChatAgentCommand, IChatAgentData, IChatAgentService } from '../../../../common/participants/chatAgents.js';
-import { localize } from '../../../../../../../nls.js';
+import { localize, localize2 } from '../../../../../../../nls.js';
+import { ChatContextKeys } from '../../../../common/actions/chatContextKeys.js';
+import { IDynamicVariable } from '../../../../common/attachments/chatVariables.js';
+import { OPEN_CHAT_FILE_REFERENCE_COMMAND_ID } from '../../../../common/constants.js';
 import { chatSlashCommandBackground, chatSlashCommandForeground } from '../../../../common/widget/chatColors.js';
 import { ChatRequestAgentPart, ChatRequestAgentSubcommandPart, ChatRequestDynamicVariablePart, ChatRequestSlashCommandPart, ChatRequestSlashPromptPart, ChatRequestTextPart, ChatRequestToolPart, ChatRequestToolSetPart, IParsedChatRequestPart, chatAgentLeader, chatSubcommandLeader } from '../../../../common/requestParser/chatParserTypes.js';
 import { agentReg, slashReg, variableReg } from '../../../../common/requestParser/chatRequestParser.js';
-import { IChatWidget } from '../../../chat.js';
+import { IChatWidget, IChatWidgetService } from '../../../chat.js';
 import { ChatWidget } from '../../chatWidget.js';
-import { ChatDynamicVariableModel, dynamicVariableDecorationType } from '../../../attachments/chatDynamicVariables.js';
+import { ChatDynamicVariableModel, clickableDynamicVariableDecorationType, dynamicVariableDecorationType } from '../../../attachments/chatDynamicVariables.js';
 import { NativeEditContextRegistry } from '../../../../../../../editor/browser/controller/editContext/native/nativeEditContextRegistry.js';
 import { TextAreaEditContextRegistry } from '../../../../../../../editor/browser/controller/editContext/textArea/textAreaEditContextRegistry.js';
 import { CancellationToken } from '../../../../../../../base/common/cancellation.js';
@@ -60,6 +67,48 @@ function exactlyOneSpaceAfterPart(parsedRequest: readonly IParsedChatRequestPart
 	const nextPart = parsedRequest[partIdx + 1];
 	return nextPart && nextPart instanceof ChatRequestTextPart && nextPart.text === ' ';
 }
+
+async function openChatFileReference(variable: IDynamicVariable, editorService: IEditorService, commandService: ICommandService): Promise<void> {
+	const resource = URI.isUri(variable.data) ? variable.data : isLocation(variable.data) ? variable.data.uri : undefined;
+	if (!resource) {
+		return;
+	}
+
+	if (variable.isDirectory) {
+		await commandService.executeCommand(revealInSideBarCommand.id, resource);
+	} else {
+		await editorService.openEditor({ resource, options: { selection: isLocation(variable.data) ? variable.data.range : undefined } });
+	}
+}
+
+class OpenChatFileReferenceAction extends Action2 {
+	constructor() {
+		super({
+			id: OPEN_CHAT_FILE_REFERENCE_COMMAND_ID,
+			title: localize2('chat.openFileReference', 'Open Chat File Reference'),
+			precondition: ChatContextKeys.inChatInput,
+			keybinding: {
+				primary: KeyMod.Alt | KeyCode.F12,
+				weight: KeybindingWeight.WorkbenchContrib,
+				when: ChatContextKeys.inChatInput,
+			},
+		});
+	}
+
+	async run(accessor: ServicesAccessor): Promise<void> {
+		const widget = accessor.get(IChatWidgetService).lastFocusedWidget;
+		const position = widget?.inputEditor.getPosition();
+		if (!widget?.inputEditor.hasTextFocus() || !position) {
+			return;
+		}
+
+		const variable = widget.getContrib<ChatDynamicVariableModel>(ChatDynamicVariableModel.ID)?.getFileReferenceAtPosition(position);
+		if (variable) {
+			await openChatFileReference(variable, accessor.get(IEditorService), accessor.get(ICommandService));
+		}
+	}
+}
+registerAction2(OpenChatFileReferenceAction);
 
 class InputEditorDecorations extends Disposable {
 
@@ -110,9 +159,7 @@ class InputEditorDecorations extends Disposable {
 			}
 
 			const position = Position.lift(e.target.position);
-			const dynamicVariable = this.widget.getContrib<ChatDynamicVariableModel>(ChatDynamicVariableModel.ID)?.variables.find(variable =>
-				(variable.isFile || variable.isDirectory) && Range.containsPosition(variable.range, position)
-			);
+			const dynamicVariable = this.widget.getContrib<ChatDynamicVariableModel>(ChatDynamicVariableModel.ID)?.getFileReferenceAtPosition(position);
 			if (dynamicVariable) {
 				this.mouseDownDynamicVariable = { position, id: dynamicVariable.id, range: Range.lift(dynamicVariable.range) };
 				return;
@@ -138,15 +185,7 @@ class InputEditorDecorations extends Disposable {
 			if (mouseDownDynamicVariable && e.target.type === MouseTargetType.CONTENT_TEXT && e.target.position && mouseDownDynamicVariable.range.containsPosition(e.target.position) && Position.equals(mouseDownDynamicVariable.position, e.target.position)) {
 				const variable = this.widget.getContrib<ChatDynamicVariableModel>(ChatDynamicVariableModel.ID)?.variables.find(candidate => candidate.id === mouseDownDynamicVariable.id && Range.equalsRange(candidate.range, mouseDownDynamicVariable.range));
 				if (variable) {
-					const resource = URI.isUri(variable.data) ? variable.data : isLocation(variable.data) ? variable.data.uri : undefined;
-					const selection = isLocation(variable.data) ? variable.data.range : undefined;
-					if (resource) {
-						if (variable.isDirectory) {
-							void this.commandService.executeCommand(revealInSideBarCommand.id, resource);
-						} else {
-							void this.editorService.openEditor({ resource, options: { selection } });
-						}
-					}
+					void openChatFileReference(variable, this.editorService, this.commandService);
 				}
 				return;
 			}
@@ -209,6 +248,12 @@ class InputEditorDecorations extends Disposable {
 			borderRadius: '3px'
 		}));
 		this._register(this.codeEditorService.registerDecorationType(decorationDescription, dynamicVariableDecorationType, {
+			color: themeColorFromId(chatSlashCommandForeground),
+			backgroundColor: themeColorFromId(chatSlashCommandBackground),
+			borderRadius: '3px',
+			rangeBehavior: TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges
+		}));
+		this._register(this.codeEditorService.registerDecorationType(decorationDescription, clickableDynamicVariableDecorationType, {
 			color: themeColorFromId(chatSlashCommandForeground),
 			backgroundColor: themeColorFromId(chatSlashCommandBackground),
 			borderRadius: '3px',

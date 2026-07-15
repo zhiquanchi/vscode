@@ -3236,7 +3236,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 			if (e.added.length > 0) {
 				this._indexOfLastAttachedContextDeletedWithKeyboard = -1;
 			}
-			if (this.migrateFileAttachmentsToInput(e.added)) {
+			if (this.migrateFileAttachmentsToInput([...e.added, ...e.updated])) {
 				return;
 			}
 			this._handleAttachedContextChange();
@@ -3933,13 +3933,14 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 	}
 
 	private migrateFileAttachmentsToInput(added: readonly IChatRequestVariableEntry[]): boolean {
-		if (this._migratingFileAttachments || this._isSyncingToOrFromInputModel) {
+		if (this._migratingFileAttachments || this._isSyncingToOrFromInputModel || !this._widget?.supportsFileReferences) {
 			return false;
 		}
 
 		const entries = added.filter(attachment =>
 			!attachment.range &&
 			(attachment.kind === 'file' || attachment.kind === 'directory') &&
+			(attachment.kind !== 'directory' || typeof attachment.imageCount === 'number') &&
 			(URI.isUri(attachment.value) || isLocation(attachment.value))
 		);
 		if (entries.length === 0) {

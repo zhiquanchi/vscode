@@ -5,6 +5,7 @@
 
 import assert from 'assert';
 import { Event } from '../../../../../../base/common/event.js';
+import { observableValue } from '../../../../../../base/common/observable.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
 import { Position } from '../../../../../../editor/common/core/position.js';
 import { Range } from '../../../../../../editor/common/core/range.js';
@@ -21,6 +22,7 @@ suite('ChatDynamicVariableModel', () => {
 	test('inserts files, folders, and selections as inline references', () => {
 		const textModel = disposables.add(createTextModel(''));
 		let position = new Position(1, 1);
+		const decorationHovers: string[] = [];
 		const inputEditor = {
 			onDidChangeModelContent: textModel.onDidChangeContent.bind(textModel),
 			getModel: () => textModel,
@@ -30,10 +32,16 @@ suite('ChatDynamicVariableModel', () => {
 				textModel.applyEdits(edits.map(edit => ({ range: edit.range, text: edit.text })));
 				return true;
 			},
-			setDecorationsByType: (_description: string, _type: string, decorations: readonly object[]) => decorations.map((_, index) => `decoration-${index}`),
+			setDecorationsByType: (_description: string, _type: string, decorations: readonly { hoverMessage?: { value: string } }[]) => {
+				decorationHovers.push(...decorations.map(decoration => decoration.hoverMessage?.value ?? ''));
+				return decorations.map((_, index) => `decoration-${index}`);
+			},
 		};
 		const widget = {
 			inputEditor,
+			input: {
+				selectedLanguageModel: observableValue('selectedLanguageModel', { metadata: { family: 'gemini' } }),
+			},
 			onDidChangeActiveInputEditor: Event.None,
 			refreshParsedInput: () => { },
 		} as unknown as IChatWidget;
@@ -56,6 +64,7 @@ suite('ChatDynamicVariableModel', () => {
 			kind: 'directory',
 			name: 'src',
 			value: folder,
+			imageCount: 11,
 		}];
 
 		assert.strictEqual(model.insertFileReferences(entries), true);
@@ -82,5 +91,8 @@ suite('ChatDynamicVariableModel', () => {
 			isDirectory: true,
 		}]);
 		assert.deepStrictEqual(position, new Position(1, 28));
+		assert.strictEqual(model.getFileReferenceAtPosition(new Position(1, 1))?.id, file.toString());
+		assert.strictEqual(model.getFileReferenceAtPosition(new Position(1, 9)), undefined);
+		assert.ok(decorationHovers.some(hover => hover.includes('exceeds&nbsp;the&nbsp;maximum&nbsp;of&nbsp;10&nbsp;images')), JSON.stringify(decorationHovers));
 	});
 });

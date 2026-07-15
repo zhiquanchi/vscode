@@ -7,20 +7,24 @@ import { coalesce } from '../../../../../base/common/arrays.js';
 import { Emitter, Event } from '../../../../../base/common/event.js';
 import { IMarkdownString, MarkdownString } from '../../../../../base/common/htmlContent.js';
 import { Disposable, dispose, isDisposable, MutableDisposable } from '../../../../../base/common/lifecycle.js';
+import { autorun } from '../../../../../base/common/observable.js';
 import { URI } from '../../../../../base/common/uri.js';
+import { Position } from '../../../../../editor/common/core/position.js';
 import { IRange, Range } from '../../../../../editor/common/core/range.js';
 import { IDecorationOptions } from '../../../../../editor/common/editorCommon.js';
 import { Command, isLocation } from '../../../../../editor/common/languages.js';
+import { localize } from '../../../../../nls.js';
 import { Action2, registerAction2 } from '../../../../../platform/actions/common/actions.js';
 import { ICommandService } from '../../../../../platform/commands/common/commands.js';
 import { ServicesAccessor } from '../../../../../platform/instantiation/common/instantiation.js';
 import { ILabelService } from '../../../../../platform/label/common/label.js';
+import { getImageAttachmentLimit, IChatRequestVariableEntry } from '../../common/attachments/chatVariableEntries.js';
 import { IChatRequestVariableValue, IDynamicVariable } from '../../common/attachments/chatVariables.js';
-import { IChatRequestVariableEntry } from '../../common/attachments/chatVariableEntries.js';
 import { IChatWidget } from '../chat.js';
 import { IChatWidgetContrib } from '../widget/chatWidget.js';
 
 export const dynamicVariableDecorationType = 'chat-dynamic-variable';
+export const clickableDynamicVariableDecorationType = 'chat-clickable-dynamic-variable';
 
 
 
@@ -63,6 +67,13 @@ export class ChatDynamicVariableModel extends Disposable implements IChatWidgetC
 			this._subscribeToEditor();
 			this.updateDecorations();
 		}));
+		const selectedLanguageModel = widget.input?.selectedLanguageModel;
+		if (selectedLanguageModel) {
+			this._register(autorun(reader => {
+				selectedLanguageModel.read(reader);
+				this.updateDecorations();
+			}));
+		}
 	}
 
 	private _subscribeToEditor(): void {
@@ -161,6 +172,13 @@ export class ChatDynamicVariableModel extends Disposable implements IChatWidgetC
 		this._onDidChangeReferences.fire();
 	}
 
+	getFileReferenceAtPosition(position: Position): IDynamicVariable | undefined {
+		return this._variables.find(variable => {
+			const range = Range.lift(variable.range);
+			return (variable.isFile || variable.isDirectory) && range.containsPosition(position) && !position.equals(range.getEndPosition());
+		});
+	}
+
 	/**
 	 * Inserts file, folder, and file-selection entries into the prompt as inline references.
 	 */
@@ -223,31 +241,57 @@ export class ChatDynamicVariableModel extends Disposable implements IChatWidgetC
 		}
 
 		const validVariables = this._variables.filter(v => isValidEditorRange(v.range));
-		const decorationIds = this.widget.inputEditor.setDecorationsByType('chat', dynamicVariableDecorationType, validVariables.map((r): IDecorationOptions => ({
-			range: r.range,
-			hoverMessage: this.getHoverForReference(r)
-		})));
+		const regularVariables = validVariables.map((variable, index) => ({ variable, index })).filter(({ variable }) => !variable.isFile && !variable.isDirectory);
+		const clickableVariables = validVariables.map((variable, index) => ({ variable, index })).filter(({ variable }) => variable.isFile || variable.isDirectory);
+		const toDecorationOptions = ({ variable }: { variable: IDynamicVariable }): IDecorationOptions => ({
+			range: variable.range,
+			hoverMessage: this.getHoverForReference(variable)
+		});
+		const regularDecorationIds = this.widget.inputEditor.setDecorationsByType('chat', dynamicVariableDecorationType, regularVariables.map(toDecorationOptions));
+		const clickableDecorationIds = this.widget.inputEditor.setDecorationsByType('chat', clickableDynamicVariableDecorationType, clickableVariables.map(toDecorationOptions));
+		const decorationIds = new Map<number, string>();
+		regularDecorationIds.forEach((id, index) => decorationIds.set(regularVariables[index].index, id));
+		clickableDecorationIds.forEach((id, index) => decorationIds.set(clickableVariables[index].index, id));
 
-		this._variables = validVariables.slice(0, decorationIds.length);
+		this._variables = validVariables.filter((_, index) => decorationIds.has(index));
 		this.decorationData = [];
-		for (let i = 0; i < decorationIds.length; i++) {
+		for (let i = 0; i < validVariables.length; i++) {
+			const decorationId = decorationIds.get(i);
+			if (!decorationId) {
+				continue;
+			}
 			this.decorationData.push({
-				id: decorationIds[i],
-				text: model.getValueInRange(this._variables[i].range)
+				id: decorationId,
+				text: model.getValueInRange(validVariables[i].range)
 			});
 		}
 	}
 
 	private getHoverForReference(ref: IDynamicVariable): IMarkdownString | undefined {
 		const value = ref.data;
+		let label: string | undefined;
 		if (URI.isUri(value)) {
-			return new MarkdownString(this.labelService.getUriLabel(value, { relative: true }));
+			label = this.labelService.getUriLabel(value, { relative: true });
 		} else if (isLocation(value)) {
 			const rangeString = `#${value.range.startLineNumber}:${value.range.startColumn}-${value.range.endLineNumber}:${value.range.endColumn}`;
-			return new MarkdownString(this.labelService.getUriLabel(value.uri, { relative: true }) + rangeString);
-		} else {
+			label = this.labelService.getUriLabel(value.uri, { relative: true }) + rangeString;
+		}
+		if (!label) {
 			return undefined;
 		}
+
+		const hover = new MarkdownString().appendText(label);
+		const maxImagesPerRequest = getImageAttachmentLimit(this.widget.input?.selectedLanguageModel.get()?.metadata);
+		if (ref.isDirectory && typeof ref.imageCount === 'number' && maxImagesPerRequest !== undefined && ref.imageCount > maxImagesPerRequest) {
+			hover.appendMarkdown('\n\n');
+			hover.appendText(localize(
+				'chat.folderImageLimitExceededHover',
+				'This folder contains {0} images, which exceeds the maximum of {1} images per request. Older images will not be sent.',
+				ref.imageCount,
+				maxImagesPerRequest,
+			));
+		}
+		return hover;
 	}
 
 	/**
@@ -294,8 +338,6 @@ function isValidEditorRange(range: IRange): boolean {
 
 	return true;
 }
-
-
 
 export interface IAddDynamicVariableContext {
 	id: string;
